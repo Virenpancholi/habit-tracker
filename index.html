@@ -429,8 +429,7 @@ function parseTokenFromHash() {
   hash.split('&').forEach(p => { const [k,v] = p.split('='); params[k] = decodeURIComponent(v||''); });
   if (params.access_token) {
     const expiresIn = parseInt(params.expires_in || '3600');
-    const expiryTime = Date.now() + (expiresIn - 120) * 1000;
-    ls.set('gd_token_expiry', String(expiryTime));
+    ls.set('gd_token_expiry', String(Date.now() + (expiresIn - 120) * 1000));
   }
   return params.access_token || null;
 }
@@ -439,71 +438,6 @@ function isTokenExpired() {
   const expiry = ls.get('gd_token_expiry');
   if (!expiry) return true;
   return Date.now() > parseInt(expiry);
-}
-
-async function silentReauth() {
-  if (!clientId) return false;
-  return new Promise((resolve) => {
-    const redirectUri = window.location.href.split('?')[0].split('#')[0];
-    const src = 'https://accounts.google.com/o/oauth2/v2/auth'
-      + '?client_id=' + clientId
-      + '&response_type=token'
-      + '&redirect_uri=' + encodeURIComponent(redirectUri)
-      + '&scope=' + encodeURIComponent(GDRIVE_SCOPES)
-      + '&prompt=none';
-    const iframe = document.createElement('iframe');
-    iframe.style.display = 'none';
-    iframe.src = src;
-    let done = false;
-    iframe.onload = () => {
-      try {
-        const hash = iframe.contentWindow.location.hash.substring(1);
-        const p = {};
-        hash.split('&').forEach(kv => { const [k,v] = kv.split('='); p[k] = decodeURIComponent(v||''); });
-        if (p.access_token) {
-          accessToken = p.access_token;
-          ls.set('gd_token', accessToken);
-          const exp = parseInt(p.expires_in || '3600');
-          ls.set('gd_token_expiry', String(Date.now() + (exp - 120) * 1000));
-          done = true; resolve(true);
-        }
-      } catch(e) {}
-      if (!done) resolve(false);
-      document.body.removeChild(iframe);
-    };
-    setTimeout(() => { if (!done) { resolve(false); try { document.body.removeChild(iframe); } catch(e){} } }, 5000);
-    document.body.appendChild(iframe);
-  });
-}
-
-async function ensureValidToken() {
-  if (!accessToken || isTokenExpired()) {
-    setSyncStatus('syncing', 'Refreshing Google sign-in...');
-    const ok = await silentReauth();
-    if (!ok && clientId) {
-      // Silent failed — show reauth button
-      showReauthBanner();
-      return false;
-    }
-  }
-  return true;
-}
-
-function showReauthBanner() {
-  let b = document.getElementById('reauthBanner');
-  if (!b) {
-    b = document.createElement('div');
-    b.id = 'reauthBanner';
-    b.style.cssText = 'position:fixed;bottom:28px;left:50%;transform:translateX(-50%);background:#2C2820;color:white;border-radius:10px;padding:10px 18px;font-size:0.8rem;z-index:9000;display:flex;align-items:center;gap:12px;box-shadow:0 4px 20px rgba(0,0,0,0.3);';
-    b.innerHTML = '🔑 Google session expired &nbsp;<button onclick="reauth()" style="background:#4285F4;color:white;border:none;border-radius:6px;padding:5px 14px;font-size:0.78rem;cursor:pointer;font-family:inherit;">Sign in again</button><button onclick="document.getElementById('reauthBanner').remove()" style="background:none;border:none;color:#A09080;cursor:pointer;font-size:1rem;padding:0 4px;">✕</button>';
-    document.body.appendChild(b);
-  }
-}
-
-function reauth() {
-  const b = document.getElementById('reauthBanner');
-  if (b) b.remove();
-  window.location.href = buildAuthUrl(clientId);
 }
 
 // ══════════════════════════════════════════════
@@ -529,8 +463,7 @@ async function gdGetFileId() {
 
 async function odRead() {
   if (!accessToken) return false;
-  const tokenOk = await ensureValidToken();
-  if (!tokenOk) return false;
+  if (isTokenExpired()) { showReauthBanner(); return false; }
   setSyncStatus('syncing','Loading from Google Drive...');
   try {
     const fid = await gdGetFileId();
@@ -558,8 +491,7 @@ async function odWrite() {
   ls.set('habitData_cache', JSON.stringify(habitData));
   if (!accessToken || useLocal) return;
   if (isSyncing) { scheduleSave(); return; }
-  const tokenOk = await ensureValidToken();
-  if (!tokenOk) return;
+  if (isTokenExpired()) { showReauthBanner(); return; }
   isSyncing = true;
   const btn = document.getElementById('syncBtn');
   btn.classList.add('spinning');
@@ -851,6 +783,21 @@ function render(){
     row.innerHTML=`<span class="dp-pct">${pct}%</span><div class="dp-bar"><div class="dp-bar-fill" style="background:${COLORS[hi]};width:${pct}%"></div></div><span class="dp-count">${hd}/${hp}</span><span class="dp-streak">${ms}</span>`;
     dpEl.appendChild(row);
   });
+}
+
+function showReauthBanner() {
+  if (document.getElementById('reauthBanner')) return;
+  const b = document.createElement('div');
+  b.id = 'reauthBanner';
+  b.style.cssText = 'position:fixed;bottom:32px;left:50%;transform:translateX(-50%);background:#2C2820;color:white;border-radius:10px;padding:11px 18px;font-size:0.8rem;z-index:9000;display:flex;align-items:center;gap:12px;box-shadow:0 4px 20px rgba(0,0,0,0.3);white-space:nowrap;';
+  b.innerHTML = '🔑 Google session expired &nbsp;<button onclick="reauth()" style="background:#4285F4;color:white;border:none;border-radius:6px;padding:6px 14px;font-size:0.78rem;cursor:pointer;font-weight:600;">Tap to sign in again</button><button onclick="this.parentElement.remove()" style="background:none;border:none;color:#A09080;cursor:pointer;font-size:1.1rem;padding:0 4px;">✕</button>';
+  document.body.appendChild(b);
+}
+
+function reauth() {
+  const b = document.getElementById('reauthBanner');
+  if (b) b.remove();
+  if (clientId) window.location.href = buildAuthUrl(clientId);
 }
 
 function changeMonth(d){ currentMonth+=d; if(currentMonth<0){currentMonth=11;currentYear--;} if(currentMonth>11){currentMonth=0;currentYear++;} render(); refreshHabitButtons(); }
