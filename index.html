@@ -399,9 +399,24 @@ let syncTimer   = null;
 let isSyncing   = false;
 
 // ══════════════════════════════════════════════
-//  LOCAL STORAGE HELPERS
+//  STORAGE HELPERS — write to BOTH localStorage AND sessionStorage
+//  so Home Screen apps (which have isolated localStorage) still work
 // ══════════════════════════════════════════════
-const ls = { get: k=>{ try{return localStorage.getItem(k);}catch{return null;} }, set: (k,v)=>{ try{localStorage.setItem(k,v);}catch{} } };
+const ls = {
+  get: k => {
+    try {
+      return localStorage.getItem(k) || sessionStorage.getItem(k) || null;
+    } catch { return null; }
+  },
+  set: (k, v) => {
+    try { localStorage.setItem(k, v); } catch {}
+    try { sessionStorage.setItem(k, v); } catch {}
+  },
+  del: k => {
+    try { localStorage.removeItem(k); } catch {}
+    try { sessionStorage.removeItem(k); } catch {}
+  }
+};
 
 // ══════════════════════════════════════════════
 //  GOOGLE OAUTH 2.0  (implicit flow for SPA)
@@ -414,10 +429,39 @@ function buildAuthUrl(cid) {
        + `&scope=${scope}&prompt=select_account`;
 }
 
+function setCookie(name, value, days) {
+  const expires = new Date(Date.now() + days * 864e5).toUTCString();
+  document.cookie = name + '=' + encodeURIComponent(value) + '; expires=' + expires + '; path=/; SameSite=Lax';
+}
+
+function getCookie(name) {
+  const match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
+  return match ? decodeURIComponent(match[2]) : null;
+}
+
+function saveCredsToCookies(key, token, expiry, fileId) {
+  setCookie('gd_client_id', key, 365);
+  if (token)  setCookie('gd_token',       token,  1);
+  if (expiry) setCookie('gd_token_expiry', expiry, 1);
+  if (fileId) setCookie('gd_file_id',      fileId, 365);
+}
+
+function loadCredsFromCookies() {
+  const cid    = getCookie('gd_client_id');
+  const token  = getCookie('gd_token');
+  const expiry = getCookie('gd_token_expiry');
+  const fileId = getCookie('gd_file_id');
+  if (cid)    ls.set('gd_client_id',    cid);
+  if (token)  ls.set('gd_token',        token);
+  if (expiry) ls.set('gd_token_expiry', expiry);
+  if (fileId) ls.set('gd_file_id',      fileId);
+}
+
 function startAuth() {
   const cid = document.getElementById('clientIdInput').value.trim();
   if (!cid) { showSetupError('Please paste your Google OAuth Client ID.'); return; }
   ls.set('gd_client_id', cid);
+  setCookie('gd_client_id', cid, 365);
   clientId = cid;
   window.location.href = buildAuthUrl(cid);
 }
@@ -429,7 +473,16 @@ function parseTokenFromHash() {
   hash.split('&').forEach(p => { const [k,v] = p.split('='); params[k] = decodeURIComponent(v||''); });
   if (params.access_token) {
     const expiresIn = parseInt(params.expires_in || '3600');
-    ls.set('gd_token_expiry', String(Date.now() + (expiresIn - 120) * 1000));
+    const expiry = String(Date.now() + (expiresIn - 120) * 1000);
+    ls.set('gd_token_expiry', expiry);
+    ls.set('gd_token', params.access_token);
+    // Save to cookies so Home Screen app remembers after reopen
+    saveCredsToCookies(
+      ls.get('gd_client_id') || getCookie('gd_client_id') || '',
+      params.access_token,
+      expiry,
+      ls.get('gd_file_id') || getCookie('gd_file_id') || ''
+    );
   }
   return params.access_token || null;
 }
@@ -810,18 +863,23 @@ function showToast(msg){ const t=document.getElementById('toast'); t.textContent
 (async function init(){
   buildHabitButtons();
 
+  // 0. Load any credentials saved in cookies (survives Home Screen app reopens)
+  loadCredsFromCookies();
+
   // 1. Check if returning from OAuth redirect (token in URL hash)
   const token = parseTokenFromHash();
   if (token) {
-    window.history.replaceState(null, '', window.location.pathname); // clean URL
+    window.history.replaceState(null, '', window.location.pathname);
     accessToken = token;
-    ls.set('gd_token', token);
-    clientId = ls.get('gd_client_id') || '';
-    gdFileId = ls.get('gd_file_id') || '';
+    clientId = ls.get('gd_client_id') || getCookie('gd_client_id') || '';
+    gdFileId  = ls.get('gd_file_id')  || getCookie('gd_file_id')  || '';
+    // Save file ID to cookie after we get it
     document.getElementById('setupOverlay').classList.add('hidden');
     document.getElementById('odBadge').style.display = 'flex';
     loadCache(); render(); refreshHabitButtons();
     await odRead();
+    // After read, save file ID to cookie
+    if (gdFileId) saveCredsToCookies(clientId, accessToken, ls.get('gd_token_expiry'), gdFileId);
     render(); refreshHabitButtons();
     showToast('✓ Connected to Google Drive!');
     return;
@@ -835,12 +893,13 @@ function showToast(msg){ const t=document.getElementById('toast'); t.textContent
     return;
   }
 
-  // 3. Existing token saved
+  // 3. Existing token — check localStorage AND cookies
   const savedToken  = ls.get('gd_token');
   const savedClient = ls.get('gd_client_id');
   if (savedToken && savedClient) {
-    accessToken = savedToken; clientId = savedClient;
-    gdFileId = ls.get('gd_file_id') || '';
+    accessToken = savedToken;
+    clientId    = savedClient;
+    gdFileId    = ls.get('gd_file_id') || '';
     document.getElementById('setupOverlay').classList.add('hidden');
     document.getElementById('odBadge').style.display = 'flex';
     loadCache(); render(); refreshHabitButtons();
@@ -849,11 +908,48 @@ function showToast(msg){ const t=document.getElementById('toast'); t.textContent
     return;
   }
 
-  // 4. Pre-fill client ID if remembered
-  const rememberedCid = ls.get('gd_client_id');
-  if (rememberedCid) document.getElementById('clientIdInput').value = rememberedCid;
-  // Show setup screen
+  // 4. Have client ID but no token — auto redirect to Google sign-in (no setup screen needed)
+  const rememberedCid = ls.get('gd_client_id') || getCookie('gd_client_id');
+  if (rememberedCid) {
+    // We know who you are — just get a fresh token silently
+    clientId = rememberedCid;
+    ls.set('gd_client_id', rememberedCid);
+    document.getElementById('setupOverlay').classList.add('hidden');
+    // Show a friendly reconnect screen instead of full setup
+    showReconnectScreen(rememberedCid);
+    return;
+  }
+
+  // 5. First time — show full setup screen
+  document.getElementById('setupOverlay').classList.remove('hidden');
 })();
+
+function showReconnectScreen(cid) {
+  // Replace setup overlay content with a simple one-tap reconnect
+  const overlay = document.getElementById('setupOverlay');
+  overlay.classList.remove('hidden');
+  overlay.innerHTML = \`
+    <div style="background:white;border-radius:20px;padding:32px 28px;max-width:400px;width:100%;text-align:center;box-shadow:0 24px 64px rgba(0,0,0,0.28);">
+      <div style="font-size:2.5rem;margin-bottom:12px;">🧿</div>
+      <div style="font-family:'Playfair Display',serif;font-style:italic;font-size:1.4rem;margin-bottom:8px;">Welcome back!</div>
+      <div style="font-size:0.82rem;color:#A09080;margin-bottom:24px;line-height:1.6;">Your Google session expired.<br>Tap below to sign back in — takes 2 seconds.</div>
+      <button onclick="window.location.href=buildAuthUrl('${cid}')" 
+        style="width:100%;padding:13px;border-radius:10px;border:none;background:#4285F4;color:white;font-size:0.9rem;font-weight:600;cursor:pointer;font-family:'DM Sans',sans-serif;display:flex;align-items:center;justify-content:center;gap:8px;">
+        🔵 Sign in with Google
+      </button>
+      <button onclick="skipToLocal()" 
+        style="width:100%;padding:10px;border-radius:10px;border:1.5px solid #E8E0D0;background:white;color:#6B6058;font-size:0.82rem;cursor:pointer;font-family:'DM Sans',sans-serif;margin-top:8px;">
+        Continue without sync (local only)
+      </button>
+    </div>
+  \`;
+}
+
+function skipToLocal() {
+  useLocal = true;
+  document.getElementById('setupOverlay').classList.add('hidden');
+  loadCache(); render(); refreshHabitButtons();
+}
 </script>
 </body>
 </html>
